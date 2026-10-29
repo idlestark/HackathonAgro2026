@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "water-drop-method"
+version = "0.1.1"
+description = "Water drop method app for soil aggregate structural stability measurements"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pillow",
+    "numpy",
+    "matplotlib",
+    "opencv-python",
+    "nidaqmx",
+    "pyserial",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.briefcase]
+project_name = "Water drop method"
+bundle = "ar.edu.unicen.faa"
+version = "0.1.1"
+url = "https://github.com/alencina-faa/Water-drop-method/releases"
+license.file = "LICENSE"
+author = "A. Lencina & V. Bocchio"
+author_email = "alencina@azul.faa.unicen.edu.ar"
+
+[tool.briefcase.app.Water_drop_method]
+formal_name = "Water drop method"
+description = "A collection of scripts to implement the Water drop method to determine the strutural stability of soil aggregates"
+long_description = """More details about the app should go here.
+"""
+sources = [
+    "src/Water_drop_method",
+]
+test_sources = [
+    "tests",
+]
+requires = [
+    "pillow",
+    "numpy",
+    "matplotlib",
+    "opencv-python",
+    "nidaqmx",
+    "pyserial",
+]
+test_requires = [
+    "pytest",
+]
+
+
+
+
+

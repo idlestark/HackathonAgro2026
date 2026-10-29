@@ -1,0 +1,82 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# OSX useful to ignore
+*.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.dist-info/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IntelliJ Idea family of suites
+.idea
+*.iml
+## File-based project format:
+*.ipr
+*.iws
+## mpeltonen/sbt-idea plugin
+.idea_modules/
+
+# Briefcase log files
+logs/
+src/Water_drop_method/embedding_in_tk_sgskip.py
+threshold.txt
+output/app.exe
+output/configuración de la compilación auto-py-to-exe.json
+/estabilidad-venv-32bit
+/output32
+debug.log
+src/Water_drop_method/procesa_1_video.py
+output/hole_area.txt
+output/WDM.exe
+output/WDM_configuración auto-py-to-exe.json
+output/WDM_configuración_Inno compiler.iss
+output/WDM_installer.exe
+output/WDM_installer_0.0.9.exe
+/output
+hole_area.txt
+threshold.txt
+umbral.txt
