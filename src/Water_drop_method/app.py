@@ -11,18 +11,21 @@ import math
 import statistics
 import threading
 import time
+from typing import Optional
 try:
-    from .paths import get_hole_area_file, get_threshold_file, get_pump_timing_file
+    from .paths import get_hole_area_file, get_threshold_file, get_pump_timing_file, get_carousel_config_file
     from .camera_device import CameraOpenCV as cam
     from .data_acquisition import NIUSB6009 as dac, ArduinoUno
     from .pump_controller import PeristalticPump, list_serial_ports
+    from .carousel_controller import CarouselController, RealTimeWearAnalyzer
     NIUSB6009 = dac
 except ImportError:
     # Allows running this file directly during local debugging.
-    from paths import get_hole_area_file, get_threshold_file, get_pump_timing_file
+    from paths import get_hole_area_file, get_threshold_file, get_pump_timing_file, get_carousel_config_file
     from camera_device import CameraOpenCV as cam
     from data_acquisition import NIUSB6009 as dac, ArduinoUno
     from pump_controller import PeristalticPump, list_serial_ports
+    from carousel_controller import CarouselController, RealTimeWearAnalyzer
     NIUSB6009 = dac
 
 
@@ -30,7 +33,7 @@ class WaterDropMethod:
     def __init__(self, root):
         self.root = root
         self.root.title("Water Drop Method")
-        self.root.geometry("800x600")
+        self.root.geometry("920x680")
         
         # Create notebook (tab container)
         self.notebook = ttk.Notebook(root)
@@ -41,6 +44,7 @@ class WaterDropMethod:
         self.threshold_frame = ttk.Frame(self.notebook)
         self.measurement_frame = ttk.Frame(self.notebook)
         self.pump_frame = ttk.Frame(self.notebook)
+        self.carousel_frame = ttk.Frame(self.notebook)
         self.drop_energy_frame = ttk.Frame(self.notebook)
         self.video_processing_frame = ttk.Frame(self.notebook)
         self.help_frame = ttk.Frame(self.notebook)
@@ -50,6 +54,7 @@ class WaterDropMethod:
         self.notebook.add(self.threshold_frame, text="Set Threshold")
         self.notebook.add(self.measurement_frame, text="Measurement")
         self.notebook.add(self.pump_frame, text="Pump Control")
+        self.notebook.add(self.carousel_frame, text="Carousel (30)")
         self.notebook.add(self.drop_energy_frame, text="Drop Energy")
         self.notebook.add(self.video_processing_frame, text="Video Processing")
         self.notebook.add(self.help_frame, text="Help")
@@ -59,6 +64,20 @@ class WaterDropMethod:
         self.pump = PeristalticPump(pulse_ms=self.default_pump_pulse, interval_ms=self.default_pump_interval, drop_volume_ul=20.0)
         self.auto_pump_on_measurement = tk.BooleanVar(value=True)
         self.pump_ports_list = []
+
+        # Carousel (30 aggregates) & Real-time wear state
+        self.default_carousel_slots, self.default_carousel_steps = self.load_carousel_config_default()
+        self.carousel = CarouselController(
+            total_slots=self.default_carousel_slots,
+            steps_per_slot=self.default_carousel_steps,
+            motor_mode="STEPPER_28BYJ48",
+        )
+        self.realtime_wear_enabled = tk.BooleanVar(value=True)
+        self.auto_carousel_on_rupture = tk.BooleanVar(value=True)
+        self.share_pump_serial_var = tk.BooleanVar(value=True)
+        self.wear_analyzer = RealTimeWearAnalyzer(hole_area_px=float(self.load_hole_area_default() or 4000))
+        self.latest_wear_info = None
+        self.sample_broken_in_realtime = False
 
         # Setup Camera tab
         self.setup_camera_tab()
@@ -71,6 +90,9 @@ class WaterDropMethod:
 
         # Setup Pump Control tab
         self.setup_pump_tab()
+
+        # Setup Carousel (30 aggregates) tab
+        self.setup_carousel_tab()
         
         # Setup Drop energy tab
         self.setup_drop_energy_tab()
@@ -308,24 +330,92 @@ class WaterDropMethod:
         )
         self.stop_measurement_button.pack(pady=5)
 
+        # ---- Real-Time Wear & Carousel Automation Panel ----
+        rt_group = ttk.LabelFrame(measurement_controls_frame, text=" Real-Time Wear & Carousel ", padding=6)
+        rt_group.pack(fill=tk.X, pady=(8, 4))
+
+        rt_check = ttk.Checkbutton(
+            rt_group,
+            text="Real-time wear (gota a gota)",
+            variable=self.realtime_wear_enabled
+        )
+        rt_check.pack(anchor="w", pady=2)
+
+        hole_row = ttk.Frame(rt_group)
+        hole_row.pack(fill=tk.X, pady=2)
+        ttk.Label(hole_row, text="Orifice As (px²):").pack(side=tk.LEFT)
+        self.realtime_hole_area_var = tk.StringVar(value=str(self.load_hole_area_default() or 4000))
+        ttk.Entry(hole_row, textvariable=self.realtime_hole_area_var, width=7, justify="center").pack(side=tk.RIGHT)
+
+        carousel_auto_check = ttk.Checkbutton(
+            rt_group,
+            text="Auto-rotate Carousel on rupture",
+            variable=self.auto_carousel_on_rupture
+        )
+        carousel_auto_check.pack(anchor="w", pady=2)
+
+        samples_row = ttk.Frame(rt_group)
+        samples_row.pack(fill=tk.X, pady=2)
+        ttk.Label(samples_row, text="Samples (1-30):").pack(side=tk.LEFT)
+        self.batch_samples_var = tk.StringVar(value="30")
+        ttk.Spinbox(
+            samples_row, from_=1, to=30, textvariable=self.batch_samples_var, width=5, justify="center"
+        ).pack(side=tk.RIGHT)
+
         # Add Tutorial / Workflow button
         self.workflow_tutorial_button = ttk.Button(
             measurement_controls_frame,
             text='📖 Tutorial: Paso a Paso',
             command=self.show_measurement_tutorial
         )
-        self.workflow_tutorial_button.pack(pady=(12, 5), fill=tk.X)
+        self.workflow_tutorial_button.pack(pady=(8, 5), fill=tk.X)
 
         # Create a frame for the measurement
-        measured_drops_frame = ttk.Frame(self.measurement_frame)
+        measured_drops_frame = ttk.Frame(self.measurement_frame, padding=10)
         measured_drops_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         # Add label output for number of drops registered
         self.measured_drops_label = ttk.Label(
             measured_drops_frame,
-            text='Number of drops registered: ' + str(0)
+            text='Number of drops registered: ' + str(0),
+            font=("Segoe UI", 12, "bold")
         )
-        self.measured_drops_label.pack(pady=(50, 5))
+        self.measured_drops_label.pack(pady=(10, 4))
+
+        self.realtime_slot_label = ttk.Label(
+            measured_drops_frame,
+            text="Carousel Slot: 1 / 30 | Laser Reader: ALIGNED",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#0284c7"
+        )
+        self.realtime_slot_label.pack(pady=2)
+
+        self.realtime_wear_label = ttk.Label(
+            measured_drops_frame,
+            text="Real-Time Normalized Area (Ac-As)/(Ai-As): 1.000 | Wear: 0.0%",
+            font=("Segoe UI", 10)
+        )
+        self.realtime_wear_label.pack(pady=4)
+
+        self.realtime_wear_var = tk.DoubleVar(value=0.0)
+        self.realtime_wear_progressbar = ttk.Progressbar(
+            measured_drops_frame, variable=self.realtime_wear_var, maximum=100.0
+        )
+        self.realtime_wear_progressbar.pack(fill=tk.X, padx=20, pady=4)
+
+        self.realtime_status_banner = ttk.Label(
+            measured_drops_frame,
+            text="Status: Waiting to start measurement...",
+            font=("Segoe UI", 9, "bold"),
+            foreground="#475569"
+        )
+        self.realtime_status_banner.pack(pady=4)
+
+        # Live ROI contour preview frame
+        roi_frame = ttk.LabelFrame(measured_drops_frame, text=" Real-Time Drop-by-Drop Aggregate Contour (Ac) ", padding=6)
+        roi_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.realtime_preview_label = ttk.Label(roi_frame, anchor="center", text="Live contour preview appears here during drop impacts")
+        self.realtime_preview_label.pack(fill=tk.BOTH, expand=True)
 
 #Setup the drop energy tab
     def setup_drop_energy_tab(self):
@@ -643,6 +733,34 @@ class WaterDropMethod:
                     "tips": [
                         "Use 'Simulation' port if exploring the UI without an Arduino/ESP32 connected.",
                         "Standard target 6.0 mL/min = ~5 drops/sec (14 ms pulse + 186 ms interval).",
+                    ],
+                },
+            ),
+            (
+                "carousel",
+                "Carousel (30)",
+                {
+                    "intro": "Operate the 30-aggregate rotating disc driven by a 28BYJ-48 stepper motor (ULN2003) and/or DC motor (H-bridge) with an optical Laser Reader on ESP32/Arduino.",
+                    "cards": [
+                        {
+                            "title": "Main actions",
+                            "items": [
+                                "Connect to the ESP32/Arduino port (or share connection with Pump / use Simulation).",
+                                "Use Home (Slot 1), Next, Prev, or Go to Slot to position any of the 30 soil aggregates under the needle.",
+                                "Verify sub-millimetric alignment with the Laser Reader indicator.",
+                                "Inspect the 30-slot status matrix and export the batch results table.",
+                            ],
+                        },
+                        {
+                            "title": "Real-Time Drop-by-Drop Automation",
+                            "items": [
+                                "During Measurement, the camera calculates normalized aggregate area (Ac - As) / (Ai - As) on every drop.",
+                                "When Normalized Area <= 0 (sample broken/disintegrated), the pump pauses, the carousel rotates to the next slot with laser confirmation, and measurement resumes automatically.",
+                            ],
+                        },
+                    ],
+                    "tips": [
+                        "Supports are separated > 3.5 cm on a 33.4 cm diameter disc with splash guards to prevent the 3 cm drop splash radius from wetting adjacent samples.",
                     ],
                 },
             ),
@@ -1515,6 +1633,344 @@ class WaterDropMethod:
         close_btn = ttk.Button(bottom_bar, text="¡Entendido! Cerrar", command=tut_win.destroy)
         close_btn.pack(side=tk.RIGHT)
 
+    # Setup the 30-Aggregate Carousel & Laser Reader tab
+    def setup_carousel_tab(self):
+        container = ttk.Frame(self.carousel_frame, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        left_col = ttk.Frame(container)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        right_col = ttk.Frame(container)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # ---- Connection & Motor Configuration ----
+        conn_group = ttk.LabelFrame(left_col, text=" ESP32 / Stepper 28BYJ-48 (ULN2003) & Laser Reader ", padding=8)
+        conn_group.pack(fill=tk.X, pady=(0, 8))
+
+        share_check = ttk.Checkbutton(
+            conn_group,
+            text="Share serial port with Peristaltic Pump (Single ESP32/Arduino)",
+            variable=self.share_pump_serial_var
+        )
+        share_check.pack(anchor="w", pady=(0, 4))
+
+        port_row = ttk.Frame(conn_group)
+        port_row.pack(fill=tk.X, pady=3)
+        ttk.Label(port_row, text="Carousel Port:").pack(side=tk.LEFT, padx=(0, 6))
+        self.carousel_port_var = tk.StringVar(value="Simulation")
+        self.carousel_port_combo = ttk.Combobox(port_row, textvariable=self.carousel_port_var, state="readonly", width=22)
+        self.carousel_port_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.carousel_connect_btn = ttk.Button(port_row, text="Connect", command=self.toggle_carousel_connection)
+        self.carousel_connect_btn.pack(side=tk.RIGHT)
+
+        motor_row = ttk.Frame(conn_group)
+        motor_row.pack(fill=tk.X, pady=3)
+        ttk.Label(motor_row, text="Drive Mode:").pack(side=tk.LEFT)
+        self.carousel_motor_var = tk.StringVar(value="STEPPER_28BYJ48")
+        ttk.Combobox(
+            motor_row,
+            textvariable=self.carousel_motor_var,
+            values=["STEPPER_28BYJ48", "DC_HBRIDGE"],
+            state="readonly",
+            width=18
+        ).pack(side=tk.RIGHT)
+
+        steps_row = ttk.Frame(conn_group)
+        steps_row.pack(fill=tk.X, pady=3)
+        ttk.Label(steps_row, text="Steps per Slot (12°):").pack(side=tk.LEFT)
+        self.carousel_steps_var = tk.IntVar(value=self.default_carousel_steps)
+        ttk.Spinbox(steps_row, from_=10, to=2000, textvariable=self.carousel_steps_var, width=7, justify="center").pack(side=tk.RIGHT)
+
+        laser_row = ttk.Frame(conn_group)
+        laser_row.pack(fill=tk.X, pady=2)
+        self.carousel_use_laser_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            laser_row,
+            text="Stop & align on Optical Laser Reader (Sub-mm precision)",
+            variable=self.carousel_use_laser_var
+        ).pack(anchor="w")
+
+        cfg_btns = ttk.Frame(conn_group)
+        cfg_btns.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(cfg_btns, text="Apply Config", command=self.apply_carousel_config).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+        ttk.Button(cfg_btns, text="⭐ Save Default", command=self.save_new_default_carousel_config).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(3, 0))
+
+        self.carousel_status_label = ttk.Label(
+            conn_group, text="Status: Ready (Simulation / Shared)", foreground="#16a34a", font=("Segoe UI", 9, "bold")
+        )
+        self.carousel_status_label.pack(anchor="w", pady=(4, 0))
+
+        # ---- Positioning & Laser Alignment Controls ----
+        pos_group = ttk.LabelFrame(left_col, text=" Positioning & Laser Alignment ", padding=8)
+        pos_group.pack(fill=tk.X, pady=(0, 8))
+
+        status_row = ttk.Frame(pos_group)
+        status_row.pack(fill=tk.X, pady=4)
+        self.carousel_slot_badge = ttk.Label(
+            status_row, text="SLOT 1 / 30", font=("Segoe UI", 13, "bold"), foreground="#0284c7"
+        )
+        self.carousel_slot_badge.pack(side=tk.LEFT)
+        self.carousel_laser_badge = ttk.Label(
+            status_row, text="🟢 LASER: ALIGNED", font=("Segoe UI", 10, "bold"), foreground="#16a34a"
+        )
+        self.carousel_laser_badge.pack(side=tk.RIGHT)
+
+        nav_row = ttk.Frame(pos_group)
+        nav_row.pack(fill=tk.X, pady=4)
+        ttk.Button(nav_row, text="⏮ Home (#1)", command=self.carousel_home).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(nav_row, text="◀ Prev", command=self.carousel_prev).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        ttk.Button(nav_row, text="Next ▶", command=self.carousel_next).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        goto_row = ttk.Frame(pos_group)
+        goto_row.pack(fill=tk.X, pady=4)
+        ttk.Label(goto_row, text="Target Slot (1-30):").pack(side=tk.LEFT)
+        self.carousel_goto_var = tk.IntVar(value=1)
+        ttk.Spinbox(goto_row, from_=1, to=30, textvariable=self.carousel_goto_var, width=5, justify="center").pack(side=tk.LEFT, padx=6)
+        ttk.Button(goto_row, text="Go to Slot", command=self.carousel_goto).pack(side=tk.LEFT, padx=2)
+        ttk.Button(goto_row, text="-5 Steps", width=8, command=lambda: self.carousel_jog(-5)).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(goto_row, text="+5 Steps", width=8, command=lambda: self.carousel_jog(5)).pack(side=tk.RIGHT, padx=2)
+
+        # ---- Mechanical & Anti-Splash Specs ----
+        geom = CarouselController.calculate_geometry(total_slots=30, min_arc_spacing_cm=3.5)
+        spec_group = ttk.LabelFrame(left_col, text=" Carousel Mechanical Design ", padding=8)
+        spec_group.pack(fill=tk.BOTH, expand=True)
+        spec_text = (
+            f"• Disc Diameter: {geom['disc_diameter_cm']} cm (Radius {geom['disc_radius_cm']} cm)\n"
+            f"• Support Spacing: {geom['arc_spacing_cm']} cm (> 3.0 cm splash zone + radial baffles)\n"
+            f"• Angular Step: {geom['angle_per_slot_deg']}° per sample ({geom['steps_per_slot']} half-steps)\n"
+            f"• Linear Resolution: {geom['positioning_resolution_mm']} mm/step + Laser Index Stop\n"
+            f"• Support Orifice: Ø {geom['support_hole_diameter_mm']} mm (Area {geom['support_hole_area_mm2']} mm²)"
+        )
+        ttk.Label(spec_group, text=spec_text, justify=tk.LEFT, font=("Segoe UI", 9)).pack(anchor="w")
+
+        # ---- Right Column: 30-Aggregate Status Matrix ----
+        grid_group = ttk.LabelFrame(right_col, text=" 30-Aggregate Measurement Matrix (Real-Time Status) ", padding=8)
+        grid_group.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        matrix_frame = ttk.Frame(grid_group)
+        matrix_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.slot_cell_labels = {}
+        for s in range(1, 31):
+            r = (s - 1) // 5
+            c = (s - 1) % 5
+            cell = tk.Label(
+                matrix_frame,
+                text=f"#{s:02d}\nPENDING",
+                bg="#f1f5f9",
+                fg="#334155",
+                font=("Segoe UI", 8, "bold"),
+                relief=tk.RIDGE,
+                bd=1,
+                padx=4,
+                pady=6,
+                width=10
+            )
+            cell.grid(row=r, column=c, padx=3, pady=3, sticky="nsew")
+            self.slot_cell_labels[s] = cell
+
+        for r in range(6):
+            matrix_frame.rowconfigure(r, weight=1)
+        for c in range(5):
+            matrix_frame.columnconfigure(c, weight=1)
+
+        matrix_btns = ttk.Frame(right_col)
+        matrix_btns.pack(fill=tk.X)
+        ttk.Button(matrix_btns, text="🔄 Reset 30 Slots", command=self.reset_carousel_matrix).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(matrix_btns, text="💾 Export 30-Sample CSV", command=self.export_carousel_results_dialog).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
+
+        # Populate ports and connect in Simulation by default so carousel is ready out-of-the-box
+        ports = list_serial_ports()
+        self.carousel_port_combo["values"] = [p[1] for p in ports]
+        if ports:
+            self.carousel_port_combo.current(len(ports) - 1)  # Default to Simulation
+        self.carousel.connect(port="Simulation")
+        self.update_carousel_slot_grid()
+
+    def load_carousel_config_default(self) -> tuple[int, int]:
+        """Return saved (total_slots, steps_per_slot) or factory default (30, 137)."""
+        try:
+            with open(get_carousel_config_file(), "r", encoding="utf-8") as f:
+                parts = f.read().strip().replace(",", " ").split()
+                if len(parts) >= 2:
+                    s = int(parts[0])
+                    st = int(parts[1])
+                    if s > 0 and st > 0:
+                        return s, st
+        except Exception:
+            pass
+        return 30, 137
+
+    def save_carousel_config_default(self, total_slots: int, steps_per_slot: int) -> None:
+        with open(get_carousel_config_file(), "w", encoding="utf-8") as f:
+            f.write(f"{int(total_slots)},{int(steps_per_slot)}\n")
+
+    def save_new_default_carousel_config(self):
+        try:
+            steps = int(self.carousel_steps_var.get())
+            if steps <= 0:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Invalid Value", "Steps per slot must be a positive integer.")
+            return
+        self.save_carousel_config_default(30, steps)
+        messagebox.showinfo("Saved", f"Saved default carousel configuration: 30 slots, {steps} steps/slot.")
+
+    def toggle_carousel_connection(self):
+        if self.share_pump_serial_var.get() and self.pump.is_connected:
+            self.carousel.connect(shared_pump=self.pump)
+            self.carousel_status_label.config(text=f"Status: Shared with Pump ({self.pump.port})", foreground="#16a34a")
+            return
+
+        selected_desc = self.carousel_port_var.get()
+        port = "Simulation"
+        for dev, desc in getattr(self, "pump_ports_list", []):
+            if desc == selected_desc:
+                port = dev
+                break
+        try:
+            self.carousel.disconnect()
+            self.carousel.connect(port=port)
+            mode = "SIMULATION" if self.carousel.is_simulation else port
+            self.carousel_status_label.config(text=f"Status: Connected ({mode})", foreground="#16a34a")
+        except Exception as e:
+            messagebox.showerror("Carousel Error", f"Could not connect carousel on {port}: {e}")
+
+    def apply_carousel_config(self):
+        try:
+            steps = int(self.carousel_steps_var.get())
+            mode = self.carousel_motor_var.get()
+            self.carousel.use_laser_stop = bool(self.carousel_use_laser_var.get())
+            self.carousel.configure(total_slots=30, steps_per_slot=steps, motor_mode=mode)
+            self._log_pump_message(f"Carousel config updated: 30 slots, {steps} steps/slot, mode={mode}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not apply carousel config: {e}")
+
+    def _ensure_carousel_ready(self):
+        if self.share_pump_serial_var.get() and self.pump.is_connected:
+            self.carousel.shared_pump = self.pump
+        elif not self.carousel.is_connected:
+            self.carousel.connect(port="Simulation")
+
+    def _sync_carousel_badges(self):
+        slot = self.carousel.current_slot
+        total = self.carousel.total_slots
+        laser_ok = self.carousel.laser_aligned
+        laser_txt = "ALIGNED" if laser_ok else "SEARCHING"
+        if hasattr(self, "carousel_slot_badge"):
+            self.carousel_slot_badge.config(text=f"SLOT {slot} / {total}")
+        if hasattr(self, "carousel_laser_badge"):
+            self.carousel_laser_badge.config(
+                text=f"🟢 LASER: {laser_txt}" if laser_ok else f"🟡 LASER: {laser_txt}",
+                foreground="#16a34a" if laser_ok else "#d97706"
+            )
+        if hasattr(self, "realtime_slot_label"):
+            self.realtime_slot_label.config(text=f"Carousel Slot: {slot} / {total} | Laser Reader: {laser_txt}")
+        self.update_carousel_slot_grid()
+
+    def carousel_next(self):
+        self._ensure_carousel_ready()
+        res = self.carousel.next_slot()
+        self._sync_carousel_badges()
+        self._log_pump_message(f"Carousel advanced -> Slot {res['slot']} (Laser={res['laser_aligned']})")
+
+    def carousel_prev(self):
+        self._ensure_carousel_ready()
+        res = self.carousel.prev_slot()
+        self._sync_carousel_badges()
+        self._log_pump_message(f"Carousel reversed -> Slot {res['slot']} (Laser={res['laser_aligned']})")
+
+    def carousel_home(self):
+        self._ensure_carousel_ready()
+        res = self.carousel.home()
+        self._sync_carousel_badges()
+        self._log_pump_message(f"Carousel homed -> Slot {res['slot']} (Laser={res['laser_aligned']})")
+
+    def carousel_goto(self):
+        self._ensure_carousel_ready()
+        target = self.carousel_goto_var.get()
+        res = self.carousel.goto_slot(target)
+        self._sync_carousel_badges()
+        self._log_pump_message(f"Carousel moved to Slot {res['slot']} (Laser={res['laser_aligned']})")
+
+    def carousel_jog(self, steps: int):
+        self._ensure_carousel_ready()
+        resp = self.carousel.fine_step(steps)
+        self._log_pump_message(f"Carousel fine step ({steps}) -> {resp}")
+
+    def reset_carousel_matrix(self):
+        self.carousel.reset_slot_results()
+        self.update_carousel_slot_grid()
+
+    def update_carousel_slot_grid(self):
+        if not hasattr(self, "slot_cell_labels"):
+            return
+        cur = self.carousel.current_slot
+        for s, lbl in self.slot_cell_labels.items():
+            info = self.carousel.slot_results.get(s, {})
+            st = info.get("status", "PENDING")
+            drops = info.get("drops", 0)
+            nrg = info.get("energy_mj", 0.0)
+            if st == "BROKEN":
+                bg = "#dcfce7"
+                fg = "#166534"
+                txt = f"#{s:02d} BROKEN\n{drops} d ({nrg:.1f}mJ)"
+            elif st == "STABLE":
+                bg = "#dbeafe"
+                fg = "#1e40af"
+                txt = f"#{s:02d} STABLE\n{drops} d ({nrg:.1f}mJ)"
+            elif st == "MEASURING":
+                bg = "#fef9c3"
+                fg = "#854d0e"
+                txt = f"#{s:02d} ACTIVE\nMeasuring..."
+            else:
+                bg = "#e0f2fe" if s == cur else "#f1f5f9"
+                fg = "#0369a1" if s == cur else "#475569"
+                txt = f"#{s:02d} {'[READY]' if s == cur else 'PENDING'}"
+            lbl.config(text=txt, bg=bg, fg=fg)
+
+    def export_carousel_results_dialog(self):
+        path = fd.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+            title="Export 30-Aggregate Carousel Results"
+        )
+        if path:
+            self.export_carousel_results_csv(path)
+            messagebox.showinfo("Export Complete", f"Saved 30-aggregate results to:\n{path}")
+
+    def export_carousel_results_csv(self, csv_path: str) -> str:
+        import csv
+        rows = []
+        energies = []
+        for s in range(1, self.carousel.total_slots + 1):
+            info = self.carousel.slot_results[s]
+            rows.append([
+                info["slot"],
+                info["status"],
+                info["drops"],
+                info["energy_mj"],
+                info["initial_area_px"],
+                info["final_area_px"],
+                info["normalized_final"],
+                info["video_file"],
+            ])
+            if info["status"] in ("BROKEN", "STABLE") and info["drops"] > 0:
+                energies.append(float(info["energy_mj"]))
+
+        median_energy = round(statistics.median(energies), 4) if energies else 0.0
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Slot", "Status", "Rupture_Drops", "Breakdown_Energy_mJ",
+                "Initial_Area_px2", "Final_Area_px2", "Final_Normalized_Area", "Video_File"
+            ])
+            writer.writerows(rows)
+            writer.writerow([])
+            writer.writerow(["Median_Breakdown_Energy_mJ", median_energy])
+        return csv_path
+
     def on_app_close(self):
         """Clean shutdown when closing the main window."""
         try:
@@ -1525,6 +1981,11 @@ class WaterDropMethod:
             self.cleanup_dac()
         except Exception:
             pass
+        if hasattr(self, 'carousel') and self.carousel:
+            try:
+                self.carousel.disconnect()
+            except Exception:
+                pass
         if hasattr(self, 'pump') and self.pump:
             try:
                 self.pump.disconnect()
@@ -1814,6 +2275,31 @@ class WaterDropMethod:
         self.camera.path_name_save_video = self.nombrevid
         self.camera.set_path_name_save_video()
 
+        # Configure Real-Time Wear Analyzer & Carousel Batch
+        try:
+            hole_area_val = float(self.realtime_hole_area_var.get())
+            if hole_area_val <= 0:
+                hole_area_val = 4000.0
+        except Exception:
+            hole_area_val = 4000.0
+        self.wear_analyzer.hole_area_px = hole_area_val
+        self.wear_analyzer.reset()
+        self.latest_wear_info = None
+        self.sample_broken_in_realtime = False
+        self.user_stopped_measurement = False
+
+        try:
+            self.batch_target_count = max(1, min(30, int(self.batch_samples_var.get())))
+        except Exception:
+            self.batch_target_count = 1
+        if not self.auto_carousel_on_rupture.get():
+            self.batch_target_count = 1
+        self.batch_measured_count = 0
+
+        self._ensure_carousel_ready()
+        self.carousel.slot_results[self.carousel.current_slot]["status"] = "MEASURING"
+        self._sync_carousel_badges()
+
         # Initialize drop counter
         self.current_drops = 0
         self.measuring = True
@@ -1836,6 +2322,15 @@ class WaterDropMethod:
             # Schedule the next frame capture
             self.root.after(1, self.write_initial_frames)  #1ms delay between frames
         else:
+            # Capture baseline frame (frame 21) to initialize Real-Time Wear Analyzer ROI & Ai
+            if self.realtime_wear_enabled.get() and hasattr(self, 'camera') and self.camera:
+                try:
+                    base_frame = self.camera.get_frame()
+                    if base_frame is not None:
+                        self.wear_analyzer.initialize_baseline(base_frame)
+                except Exception:
+                    pass
+
             # The Arduino is opened before the message: opening the port resets the board (~2 s)
             try:
                 if self.selected_dac == "ArduinoUno":
@@ -1846,7 +2341,8 @@ class WaterDropMethod:
                 self.finish_measurement()
                 return
 
-            messagebox.showinfo("Start measurement", "If drops are ready, press OK to start measurement.")
+            if getattr(self, 'batch_measured_count', 0) == 0:
+                messagebox.showinfo("Start measurement", "If drops are ready, press OK to start measurement.")
 
             if self.selected_dac == "NIUSB6009":
                 self.measurer = NIUSB6009(device_name="Dev1", channel="ai0", sample_rate=1000, samples_per_channel=10000)
@@ -1873,7 +2369,7 @@ class WaterDropMethod:
             self.poll_measurement()
 
     def _acquisition_loop(self):
-        """Worker thread: read the photodiode as fast as possible and take one frame per drop."""
+        """Worker thread: read the photodiode, capture one frame per drop, and process wear in real time."""
         armed = True
         try:
             while self.measuring and self.current_drops < self.total_drops:
@@ -1889,19 +2385,60 @@ class WaterDropMethod:
                     if armed:
                         armed = False
                         frame = self.camera.get_frame()
+                        drop_idx = self.current_drops + 1
                         self.captured_frames.append({
-                            'drop_number': self.current_drops + 1,
+                            'drop_number': drop_idx,
                             'frame': frame
                         })
-                        self.current_drops += 1
+                        self.current_drops = drop_idx
+
+                        # Real-time drop-by-drop wear & rupture detection
+                        if getattr(self, 'realtime_wear_enabled', None) and self.realtime_wear_enabled.get():
+                            if frame is not None:
+                                wear_info = self.wear_analyzer.process_drop_frame(frame, drop_number=drop_idx)
+                                self.latest_wear_info = wear_info
+                                if wear_info.get("is_broken", False):
+                                    self.sample_broken_in_realtime = True
+                                    break
                 else:
                     armed = True
         except Exception as e:
             self.worker_error = e
 
     def poll_measurement(self):
-        """GUI side: refresh the counter and detect the end of the worker thread."""
+        """GUI side: refresh the counter, real-time wear status, and detect the end of the worker thread."""
         self.measured_drops_label.config(text=f'Number of drops registered: {self.current_drops}')
+
+        # Update real-time wear widgets if new drop frame was processed
+        wear_info = getattr(self, 'latest_wear_info', None)
+        if wear_info is not None:
+            norm_val = wear_info["normalized_area"]
+            wear_pct = wear_info["wear_percent"]
+            self.realtime_wear_label.config(
+                text=f"Real-Time Normalized Area (Ac-As)/(Ai-As): {norm_val:.3f} | Wear: {wear_pct:.1f}%"
+            )
+            self.realtime_wear_var.set(wear_pct)
+            if wear_info["is_broken"]:
+                self.realtime_status_banner.config(
+                    text=f"⚡ RUPTURE DETECTED AT DROP #{wear_info['rupture_drop']}! Advancing Carousel...",
+                    foreground="#dc2626"
+                )
+            else:
+                self.realtime_status_banner.config(
+                    text=f"Measuring Slot #{self.carousel.current_slot} (Drop {wear_info['drop_number']})...",
+                    foreground="#0284c7"
+                )
+            roi_img = wear_info.get("annotated_roi")
+            if roi_img is not None and roi_img.size > 0:
+                try:
+                    rgb_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2RGB)
+                    pil_roi = Image.fromarray(rgb_roi)
+                    tk_roi = ImageTk.PhotoImage(image=pil_roi)
+                    self.realtime_preview_label.configure(image=tk_roi, text="")
+                    self.realtime_preview_label.image = tk_roi
+                except Exception:
+                    pass
+
         if self.worker_thread.is_alive():
             self.root.after(100, self.poll_measurement)
             return
@@ -1911,40 +2448,34 @@ class WaterDropMethod:
         self.finish_measurement()
 
     # Save acquired frames to disk
-    def save_captured_frames_to_disk(self):
+    def save_captured_frames_to_disk(self, target_video_path: Optional[str] = None, keep_camera_open: bool = False):
         """Save the captured frames stored in RAM to disk in a separate thread."""
         if not hasattr(self, 'captured_frames') or not self.captured_frames:
-            self.cleanup_camera()
+            if not keep_camera_open:
+                self.cleanup_camera()
             return
 
-        # Frames are copied to free the main reference
         frames_to_save = list(self.captured_frames)
-        self.captured_frames = [] # Empty RAM for next measurement session
+        self.captured_frames = []  # Empty RAM for next measurement session
 
-        # The camera reference is saved before it changes to None
         camera_ref = self.camera
-        self.camera = None # Clear the camera reference to avoid accidental use during saving
+        if not keep_camera_open:
+            self.camera = None
 
         def _writer_thread():
-            print(f"Saving {len(frames_to_save)} images to disk...")
             if camera_ref:
-                # Save frames to disk using the camera's method
+                if target_video_path:
+                    camera_ref.path_name_save_video = target_video_path
+                    camera_ref.set_path_name_save_video()
                 camera_ref.save_frames_to_avi(frames_to_save)
-                camera_ref.stop()
-                camera_ref.close_window()      
-                print("Video saved successfully!")
+                if not keep_camera_open:
+                    camera_ref.stop()
+                    camera_ref.close_window()
 
-        # Execute disk writing in a separate thread to avoid blocking the GUI
         threading.Thread(target=_writer_thread, daemon=True).start()
     
     def finish_measurement(self):
-        """Clean up after measurement is complete."""
-        # Show completion message
-        if self.current_drops >= self.total_drops:
-            messagebox.showinfo("Measurement Complete", f"Successfully recorded {self.current_drops} drops.")
-        else:
-            messagebox.showinfo("Measurement Stopped", f"Measurement stopped after recording {self.current_drops} drops.")
-
+        """Clean up after single aggregate measurement or advance carousel for 30-sample batch."""
         # Stop and close the measurer task
         if hasattr(self, 'selected_dac') and self.selected_dac in ["NIUSB6009", "ArduinoUno"]:
             if hasattr(self, 'measurer') and self.measurer is not None:
@@ -1954,26 +2485,105 @@ class WaterDropMethod:
                 except Exception:
                     pass
 
-        # Auto-stop peristaltic pump if enabled and running
+        # Auto-stop peristaltic pump while saving / rotating carousel
         if hasattr(self, 'auto_pump_on_measurement') and self.auto_pump_on_measurement.get():
             if hasattr(self, 'pump') and self.pump.is_connected and self.pump.is_running:
                 try:
                     self.stop_pump_flow()
                 except Exception as e:
                     print(f"Warning: could not auto-stop pump: {e}")
-            
-        # Set flag to stop the measurement process
+
+        # Record current aggregate result in the 30-slot Carousel
+        slot_num = self.carousel.current_slot
+        broke = bool(getattr(self, 'sample_broken_in_realtime', False))
+        status_str = "BROKEN" if broke else ("STABLE" if self.current_drops >= self.total_drops else "STOPPED")
+        energy_per_drop_mj = 0.102
+        total_energy_mj = self.current_drops * energy_per_drop_mj
+        wear_info = getattr(self, 'latest_wear_info', None) or {}
+        init_area = wear_info.get("initial_area_px", self.wear_analyzer.initial_area_px)
+        final_area = wear_info.get("smoothed_area_px", 0.0)
+        norm_final = wear_info.get("normalized_area", 0.0 if broke else 1.0)
+
+        base_vid, ext_vid = os.path.splitext(getattr(self, 'nombrevid', 'measurement.avi'))
+        if getattr(self, 'batch_target_count', 1) > 1:
+            slot_video_path = f"{base_vid}_slot{slot_num:02d}{ext_vid or '.avi'}"
+        else:
+            slot_video_path = getattr(self, 'nombrevid', 'measurement.avi')
+
+        self.carousel.record_slot_result(
+            slot=slot_num,
+            status=status_str,
+            drops=self.current_drops,
+            energy_mj=total_energy_mj,
+            initial_area_px=init_area,
+            final_area_px=final_area,
+            normalized_final=norm_final,
+            video_file=os.path.basename(slot_video_path),
+        )
+        self.batch_measured_count = getattr(self, 'batch_measured_count', 0) + 1
+        self._sync_carousel_badges()
+
+        # Check if we should automatically rotate carousel to the next aggregate and continue
+        should_continue_batch = (
+            getattr(self, 'auto_carousel_on_rupture', None) is not None
+            and self.auto_carousel_on_rupture.get()
+            and not getattr(self, 'user_stopped_measurement', False)
+            and self.batch_measured_count < getattr(self, 'batch_target_count', 1)
+        )
+
+        if should_continue_batch:
+            self.save_captured_frames_to_disk(target_video_path=slot_video_path, keep_camera_open=True)
+            res = self.carousel.next_slot()
+            self.carousel.slot_results[res["slot"]]["status"] = "MEASURING"
+            self._sync_carousel_badges()
+            self.realtime_status_banner.config(
+                text=f"Rotated to Slot #{res['slot']} (Laser={'ALIGNED' if res['laser_aligned'] else 'OK'}). Starting next sample...",
+                foreground="#16a34a"
+            )
+            # Reset for next aggregate in batch
+            self.wear_analyzer.reset()
+            self.latest_wear_info = None
+            self.sample_broken_in_realtime = False
+            self.current_drops = 0
+            self.measuring = True
+            self.frame_count = 0
+            self.root.after(250, self.write_initial_frames)
+            return
+
+        # Batch or single measurement finished completely
         self.measuring = False
-
-        # Disable the stop button
         self.stop_measurement_button.config(state=tk.DISABLED)
+        self.start_measurement_button.config(state=tk.NORMAL)
+        self.save_captured_frames_to_disk(target_video_path=slot_video_path, keep_camera_open=False)
 
-        # Save frames to disk and releases camera resourses in a separate tread to avoid blocking the GUI
-        self.save_captured_frames_to_disk()
+        if getattr(self, 'batch_target_count', 1) > 1 and self.batch_measured_count > 1:
+            summary_csv = f"{base_vid}_30_Aggregates_Summary.csv"
+            try:
+                self.export_carousel_results_csv(summary_csv)
+            except Exception:
+                pass
+            messagebox.showinfo(
+                "Batch Measurement Complete",
+                f"Automatically measured {self.batch_measured_count} aggregates.\n"
+                f"Last sample ({status_str}): {self.current_drops} drops ({total_energy_mj:.2f} mJ).\n"
+                f"Summary saved to:\n{summary_csv}"
+            )
+        else:
+            if broke:
+                messagebox.showinfo(
+                    "Aggregate Rupture Detected",
+                    f"Real-time camera analysis detected aggregate breakdown at {self.current_drops} drops "
+                    f"(Energy = {total_energy_mj:.2f} mJ)."
+                )
+            elif self.current_drops >= self.total_drops:
+                messagebox.showinfo("Measurement Complete", f"Successfully recorded {self.current_drops} drops.")
+            else:
+                messagebox.showinfo("Measurement Stopped", f"Measurement stopped after recording {self.current_drops} drops.")
                 
 
     def stop_measurement(self):
         """Stop the measurement."""
+        self.user_stopped_measurement = True
         # Set flag to stop the measurement process
         self.measuring = False
 
@@ -1982,7 +2592,7 @@ class WaterDropMethod:
             if hasattr(self, 'pump') and self.pump.is_connected and self.pump.is_running:
                 try:
                     self.stop_pump_flow()
-                except Exception as e:
+                except Exception:
                     pass
     
 #Functions of the drop energy tab

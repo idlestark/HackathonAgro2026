@@ -43,3 +43,11 @@ def get_pump_timing_file(migrate_legacy: bool = True) -> Path:
         _migrate_legacy_file("pump_timing.txt", destination)
     return destination
 
+
+def get_carousel_config_file(migrate_legacy: bool = True) -> Path:
+    destination = get_state_dir() / "carousel_config.txt"
+    if migrate_legacy:
+        _migrate_legacy_file("carousel_config.txt", destination)
+    return destination
+
+

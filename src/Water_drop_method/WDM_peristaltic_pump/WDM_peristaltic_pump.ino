@@ -23,7 +23,7 @@
  */
 
 #if defined(ESP32)
-  const int PIN_BOMBA = 18;  // GPIO para ESP32-C3
+  const int PIN_BOMBA = 5;  // GPIO para ESP32-C3
 #else
   const int PIN_BOMBA = 9;   // Pin digital PWM para Arduino Uno
 #endif
